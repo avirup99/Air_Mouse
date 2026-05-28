@@ -96,7 +96,7 @@ node index.js
 ```bash
 cd agent
 pip install pyautogui websockets
-python agent.py
+.\run.bat
 ```
 
 ### Flutter App
@@ -118,6 +118,12 @@ Phone  ──WebSocket──►  Relay Server  ──WebSocket──►  PC Agen
 The relay server sits in the cloud and passes commands from your phone to your PC. No direct connection between devices needed — works over the internet.
 
 ---
+
+### Future and current updates 
+
+The android tv support will soon be released.
+the tv_remote_ui.dart is updated where the apk is build is built on its older version, it should run fine even if you build with the updated version.
+
 
 ## 📄 License
 
