@@ -96,7 +96,7 @@ node index.js
 ```bash
 cd agent
 pip install pyautogui websockets
-.\run.bat
+.\build.bat
 ```
 
 ### Flutter App
