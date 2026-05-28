@@ -2,59 +2,77 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 8080;
+const ROOM_TTL_MS = 5 * 60 * 1000; // keep empty rooms for 5 min
 
-// Grace period before a room is deleted after everyone leaves (ms).
-// This gives phones time to reconnect after a screen lock / network blip.
-const ROOM_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-// rooms: { code -> { host, deviceType, phones, deleteTimer } }
 const rooms = new Map();
+// { code -> { host: WebSocket|null, deviceType, phones: Set<WebSocket>, deleteTimer } }
 
-function getOrCreateRoom(code, deviceType = 'pc') {
-  if (!rooms.has(code)) {
+function makeCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let c = '';
+  for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return c;
+}
+function uniqueCode() {
+  let c; do { c = makeCode(); } while (rooms.has(c)); return c;
+}
+
+function getRoom(code) { return rooms.get(code); }
+
+function ensureRoom(code, deviceType) {
+  if (!rooms.has(code))
     rooms.set(code, { host: null, deviceType, phones: new Set(), deleteTimer: null });
-  }
   return rooms.get(code);
 }
 
-// Cancel any pending deletion for this room (someone reconnected in time).
-function keepRoom(code) {
-  const room = rooms.get(code);
-  if (!room) return;
-  if (room.deleteTimer) {
-    clearTimeout(room.deleteTimer);
-    room.deleteTimer = null;
-  }
+function keepAlive(code) {
+  const r = rooms.get(code);
+  if (!r) return;
+  clearTimeout(r.deleteTimer);
+  r.deleteTimer = null;
 }
 
-// Schedule room deletion after TTL — only if still empty when timer fires.
-function scheduleRoomCleanup(code) {
-  const room = rooms.get(code);
-  if (!room) return;
-
-  // Cancel any existing timer first.
-  if (room.deleteTimer) clearTimeout(room.deleteTimer);
-
-  room.deleteTimer = setTimeout(() => {
-    const r = rooms.get(code);
-    if (r && !r.host && r.phones.size === 0) {
+function scheduleDrop(code) {
+  const r = rooms.get(code);
+  if (!r) return;
+  clearTimeout(r.deleteTimer);
+  r.deleteTimer = setTimeout(() => {
+    const r2 = rooms.get(code);
+    if (r2 && !r2.host && r2.phones.size === 0) {
       rooms.delete(code);
-      console.log(`[room ${code}] expired and deleted`);
+      console.log(`[room ${code}] expired`);
     }
   }, ROOM_TTL_MS);
 }
 
-function generateCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
+function attachHost(ws, code, deviceType) {
+  const room = ensureRoom(code, deviceType);
+  room.host = ws;
+  room.deviceType = deviceType;
+  ws._code = code;
+  ws._role = 'host';
+  keepAlive(code);
 
-function makeUniqueCode() {
-  let code;
-  do { code = generateCode(); } while (rooms.has(code));
-  return code;
+  ws.send(JSON.stringify({ type: 'registered', code, deviceType }));
+
+  // Tell any waiting phones the host is back
+  room.phones.forEach(p => {
+    if (p.readyState === WebSocket.OPEN)
+      p.send(`status:connected:${deviceType}`);
+  });
+
+  ws.on('message', () => {});
+  ws.on('close', () => {
+    const r = rooms.get(code);
+    if (r) {
+      r.host = null;
+      r.phones.forEach(p => {
+        if (p.readyState === WebSocket.OPEN) p.send('status:host_disconnected');
+      });
+      scheduleDrop(code);
+    }
+    console.log(`[room ${code}] host left — room held for ${ROOM_TTL_MS/1000}s`);
+  });
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -64,8 +82,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ status: 'ok', rooms: rooms.size }));
     return;
   }
-  res.writeHead(200);
-  res.end('Air Mouse Relay');
+  res.writeHead(200); res.end('Air Mouse Relay');
 });
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -75,73 +92,34 @@ wss.on('connection', (ws, req) => {
   const url = req.url || '/';
   console.log(`[ws] ${url}`);
 
-  // ── Host registers fresh ──────────────────────────────────────────────────
+  // ── /register?type=pc|tv  → fresh registration, always new code ───────────
   if (url.startsWith('/register')) {
     const params = new URLSearchParams(url.split('?')[1] || '');
     const deviceType = params.get('type') === 'tv' ? 'tv' : 'pc';
-    const code = makeUniqueCode();
-    const room = getOrCreateRoom(code, deviceType);
-    room.host = ws;
-    room.deviceType = deviceType;
-    ws._code = code;
-    ws._role = 'host';
-    keepRoom(code); // cancel any deletion
-
-    ws.send(JSON.stringify({ type: 'registered', code, deviceType }));
-    console.log(`[room ${code}] ${deviceType} host registered`);
-
-    ws.on('message', () => {});
-    ws.on('close', () => {
-      const r = rooms.get(code);
-      if (r) {
-        r.host = null;
-        r.phones.forEach(p => {
-          if (p.readyState === WebSocket.OPEN) p.send('status:host_disconnected');
-        });
-        scheduleRoomCleanup(code); // keep room alive for TTL
-      }
-      console.log(`[room ${code}] host disconnected — room kept for ${ROOM_TTL_MS/1000}s`);
-    });
+    const code = uniqueCode();
+    console.log(`[room ${code}] registered (${deviceType})`);
+    attachHost(ws, code, deviceType);
     return;
   }
 
-  // ── Host reconnects to existing room ─────────────────────────────────────
-  const hostMatch = url.match(/^\/host\/([A-Z0-9]{6})\?type=(pc|tv)$/);
-  if (hostMatch) {
-    const code = hostMatch[1];
-    const deviceType = hostMatch[2];
-    const room = getOrCreateRoom(code, deviceType);
-    room.host = ws;
-    room.deviceType = deviceType;
-    ws._code = code;
-    ws._role = 'host';
-    keepRoom(code);
-
-    ws.send(JSON.stringify({ type: 'registered', code, deviceType }));
-    room.phones.forEach(p => {
-      if (p.readyState === WebSocket.OPEN) p.send('status:connected');
-    });
-    console.log(`[room ${code}] host reconnected`);
-
-    ws.on('message', () => {});
-    ws.on('close', () => {
-      const r = rooms.get(code);
-      if (r) {
-        r.host = null;
-        r.phones.forEach(p => {
-          if (p.readyState === WebSocket.OPEN) p.send('status:host_disconnected');
-        });
-        scheduleRoomCleanup(code);
-      }
-    });
+  // ── /rejoin/:CODE?type=pc|tv  → PC agent slots back into existing room ─────
+  // Used by agent.py after a reconnect so the same room code stays valid.
+  const rejoinMatch = url.match(/^\/rejoin\/([A-Z0-9]{6})(\?.*)?$/);
+  if (rejoinMatch) {
+    const code = rejoinMatch[1];
+    const params = new URLSearchParams((rejoinMatch[2] || '').slice(1));
+    const deviceType = params.get('type') === 'tv' ? 'tv' : 'pc';
+    // Room may or may not exist (phones could be waiting in it already).
+    console.log(`[room ${code}] host rejoining`);
+    attachHost(ws, code, deviceType);
     return;
   }
 
-  // ── Phone connects / reconnects ───────────────────────────────────────────
+  // ── /phone/:CODE  → phone connects or reconnects ──────────────────────────
   const phoneMatch = url.match(/^\/phone\/([A-Z0-9]{6})$/);
   if (phoneMatch) {
     const code = phoneMatch[1].toUpperCase();
-    const room = rooms.get(code);
+    const room = getRoom(code);
 
     if (!room) {
       ws.send('error:room_not_found');
@@ -149,33 +127,28 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    keepRoom(code); // phone is back — cancel any pending deletion
+    keepAlive(code);
     room.phones.add(ws);
     ws._code = code;
     ws._role = 'phone';
 
-    const statusMsg = room.host && room.host.readyState === WebSocket.OPEN
+    const ready = room.host && room.host.readyState === WebSocket.OPEN;
+    ws.send(ready
       ? `status:connected:${room.deviceType}`
-      : `status:waiting_for_host:${room.deviceType}`;
-    ws.send(statusMsg);
+      : `status:waiting_for_host:${room.deviceType}`);
 
-    console.log(`[room ${code}] phone joined — controlling ${room.deviceType}`);
+    console.log(`[room ${code}] phone joined`);
 
     ws.on('message', (data) => {
       const r = rooms.get(code);
-      if (r && r.host && r.host.readyState === WebSocket.OPEN) {
+      if (r && r.host && r.host.readyState === WebSocket.OPEN)
         r.host.send(data.toString());
-      }
     });
 
     ws.on('close', () => {
       const r = rooms.get(code);
-      if (r) {
-        r.phones.delete(ws);
-        // Don't delete the room immediately — phone may reconnect shortly.
-        scheduleRoomCleanup(code);
-      }
-      console.log(`[room ${code}] phone disconnected — room kept for ${ROOM_TTL_MS/1000}s`);
+      if (r) { r.phones.delete(ws); scheduleDrop(code); }
+      console.log(`[room ${code}] phone left — room held for ${ROOM_TTL_MS/1000}s`);
     });
     return;
   }
@@ -184,4 +157,4 @@ wss.on('connection', (ws, req) => {
   ws.close();
 });
 
-server.listen(PORT, () => console.log(`Relay on port ${PORT}`));
+server.listen(PORT, () => console.log(`Relay on :${PORT}`));
