@@ -1,8 +1,0 @@
-{
-  "name": "airmouse-relay",
-  "version": "2.0.0",
-  "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "ws": "^8.17.0" }
-}
