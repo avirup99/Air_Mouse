@@ -43,6 +43,7 @@ class _RemoteUIState extends State<RemoteUI> {
         final lk = event.logicalKey;
 
         if (lk == LogicalKeyboardKey.backspace) {
+          // Hardware keyboard backspace — send to laptop AND update local box
           widget.sendCommand("key:BACKSPACE");
           final text = _typeController.text;
           final sel = _typeController.selection;
@@ -71,12 +72,20 @@ class _RemoteUIState extends State<RemoteUI> {
 
   void _handleMobileKeyboard(String newValue) {
     final prev = _prevText;
+    _prevText = newValue;
 
-    if (newValue.length <= prev.length) {
-      _prevText = newValue;
+    if (newValue.length < prev.length) {
+      // Text was deleted — send one BACKSPACE per deleted character
+      final deletedCount = prev.length - newValue.length;
+      for (int i = 0; i < deletedCount; i++) {
+        widget.sendCommand("key:BACKSPACE");
+      }
       return;
     }
 
+    if (newValue.length == prev.length) return; // selection change, ignore
+
+    // Text was added — send each new character
     final added = newValue.substring(prev.length);
     for (final char in added.characters) {
       if (char == '\n') {
@@ -87,8 +96,6 @@ class _RemoteUIState extends State<RemoteUI> {
         widget.sendCommand("key:$char");
       }
     }
-
-    _prevText = newValue;
   }
 
   @override
